@@ -1,72 +1,81 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
-    AIMessagePromptTemplate,
     ChatPromptTemplate,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import pipeline
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 import logging
+from functools import lru_cache
 
 # Initialize FastAPI app
 app = FastAPI()
 
-# Enable CORS for all origins (adjust as needed)
+# Enable CORS for specific trusted domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Change this to your frontend URL
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+# Set up rate limiter (10 requests per minute per user)
+limiter = Limiter(key_func=get_remote_address)
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 
-# Request model
+# Define request model
 class ChatRequest(BaseModel):
     userMessage: str
 
-# Load emotion classification model with error handling
-try:
-    emotion_classifier = pipeline(
-        "text-classification",
-        model="j-hartmann/emotion-english-distilroberta-base",
-        return_all_scores=True
-    )
-except Exception as e:
-    logging.error(f"Error loading emotion model: {e}")
-    emotion_classifier = None  # Fallback to prevent crashes
-
-# Initialize Chat Model
-llm_engine = ChatOllama(
-    model="deepseek-r1:1.5b",  # Change model if needed
-    base_url="http://localhost:11434",  # Ensure Ollama server is running
-    temperature=0.5
-)
-
-# System prompt for the chatbot
-system_prompt = SystemMessagePromptTemplate.from_template(
-    "You are an empathetic, compassionate, and uplifting AI mental health companion..."
-)
+# Load emotion classification model once (optimized)
+@lru_cache(maxsize=1)
+def get_emotion_classifier():
+    try:
+        return pipeline(
+            "text-classification",
+            model="j-hartmann/emotion-english-distilroberta-base"
+        )
+    except Exception as e:
+        logging.error(f"Error loading emotion model: {e}")
+        return None  # Avoid crashes if model fails
 
 # Function to analyze emotions from a given text
 def analyze_emotion(text: str) -> str:
-    if not emotion_classifier:
-        return "unknown"  # Default if the model failed to load
+    classifier = get_emotion_classifier()
+    if not classifier:
+        return "unknown"
 
     try:
-        result = emotion_classifier(text)
-        emotions = {emotion["label"]: round(emotion["score"], 4) for emotion in result[0]}
-        dominant_emotion = max(emotions, key=emotions.get)
-        return dominant_emotion
+        result = classifier(text)
+        return result[0]['label']  # Directly return the most relevant emotion
     except Exception as e:
         logging.error(f"Error analyzing emotion: {e}")
         return "error"
+
+# Load Chat Model once (optimized)
+@lru_cache(maxsize=1)
+def get_chat_model():
+    return ChatOllama(
+        model="mistral:latest",
+        base_url="http://localhost:11434",
+        temperature=0.5
+    )
+
+llm_engine = get_chat_model()
+
+# System prompt for chatbot
+system_prompt = SystemMessagePromptTemplate.from_template(
+    "You are an empathetic, compassionate, and uplifting AI mental health companion..."
+)
 
 # Function to generate AI response
 async def generate_ai_response(user_message: str) -> dict:
@@ -84,22 +93,32 @@ async def generate_ai_response(user_message: str) -> dict:
 
         # Step 3: Generate response from AI model
         processing_pipeline = ChatPromptTemplate.from_messages(prompt_sequence) | llm_engine | StrOutputParser()
-        response_text = processing_pipeline.invoke({})
+        response_text = processing_pipeline.invoke({"input": user_message})
+
+        # Step 4: Ensure response is not empty
+        if not response_text or response_text.strip() == "":
+            logging.warning("AI response was empty.")
+            response_text = "I'm here to help, but I didn't understand that. Can you elaborate?"
 
         return {
-            "response": response_text,
+            "response": response_text.strip(),
             "emotion": detected_emotion
         }
     except Exception as e:
         logging.error(f"Error generating AI response: {e}")
-        raise HTTPException(status_code=500, detail="Error processing request")
+        return {
+            "response": "I'm currently facing technical issues. Please try again later.",
+            "emotion": "error"
+        }
 
-# Endpoint: Process user message (handles both emotion & AI response)
+# Chat endpoint with rate limiting
 @app.post("/chat/")
-async def chat(request: ChatRequest):
-    result = await generate_ai_response(request.userMessage)
+@limiter.limit("10/minute")
+async def chat(request: Request, chat_request: ChatRequest):
+    result = await generate_ai_response(chat_request.userMessage)
     return result
 
+# Root endpoint
 @app.get("/")
 async def root():
     return {"message": "Chat API is running!"}
